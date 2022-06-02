@@ -1,0 +1,90 @@
+WITH 
+
+dt AS(
+    SELECT
+        DATE_SUB(current_month_end, INTERVAL (61 + DATE_DIFF(current_month_end, current_month_start, DAY)) DAY) AS num_prev_period_start,
+        DATE_SUB(current_month_end, INTERVAL 61 DAY) AS num_prev_period_end,
+        DATE_SUB(current_month_start, INTERVAL 60 DAY) AS den_current_period_start,
+        current_month_start,
+        current_month_end
+    FROM(
+        SELECT
+            DATE_TRUNC(dates, MONTH) AS current_month_start,
+            IF(
+                FORMAT_DATE('%Y%m', LAST_DAY(dates, MONTH)) = FORMAT_DATE('%Y%m', CURRENT_DATE()),
+                CURRENT_DATE(),
+                LAST_DAY(dates, MONTH)
+            ) AS current_month_end
+        FROM
+            UNNEST(
+                GENERATE_DATE_ARRAY(
+                    (SELECT PARSE_DATE('%Y%m%d', CAST(MIN(report_for_date) AS STRING)) FROM taara_share_analytics.customer_network_sessions),
+                    (SELECT CURRENT_DATE()),
+                    INTERVAL 1 DAY
+                )
+            ) AS dates
+        GROUP BY
+            current_month_start,
+            current_month_end
+    ) AS periods
+),
+
+
+
+se AS(
+    SELECT DISTINCT
+        PARSE_DATE('%Y%m%d', CAST(ne.report_for_date AS STRING)) AS session_date,
+        ne.customer_id,
+        IFNULL(tp.user_status, 'Free') AS user_status,
+        MIN(PARSE_DATE('%Y%m%d', CAST(ne.report_for_date AS STRING))) OVER(PARTITION BY ne.customer_id) AS first_session_date
+    FROM
+        taara_share_analytics.customer_network_sessions AS ne
+    LEFT OUTER JOIN(
+        SELECT DISTINCT
+            customer_id,
+            IF(
+                LAST_VALUE(plan_display_name) OVER(PARTITION BY customer_id ORDER BY txn_epoch_seconds ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) = '500 MB Free Trial', 
+                'Free', 
+                'Paying'
+            ) AS user_status
+        FROM
+            taara_share_analytics.customer_topups
+    ) AS tp
+        ON ne.customer_id = tp.customer_id
+)
+
+
+
+SELECT
+    current_month_end,
+    customer_id,
+    user_status,
+    MAX(CASE WHEN num_active_in_prev_period = 1 AND num_active_in_current_period = 0 THEN days_since_first_session END) AS days_before_churn,
+    SUM(num_active_in_prev_period) AS num_sessions_in_prev_period,
+    SUM(num_active_in_current_period) AS num_sessions_in_current_period,
+    SUM(den_active_in_current_period) AS den_sessions_in_current_period
+FROM(
+    SELECT
+        current_month_end,
+        session_date,
+        customer_id,
+        user_status,
+        DATE_DIFF(session_date, first_session_date, DAY) AS days_since_first_session,
+        (CASE WHEN session_date BETWEEN num_prev_period_start AND num_prev_period_end THEN 1 ELSE 0 END) AS num_active_in_prev_period,
+        (CASE WHEN session_date > num_prev_period_end AND session_date <= current_month_end THEN 1 ELSE 0 END) AS num_active_in_current_period,
+        (CASE WHEN session_date >= den_current_period_start AND session_date < current_month_start THEN 1 ELSE 0 END) AS den_active_in_current_period,
+    FROM
+        se
+    CROSS JOIN
+        dt
+)
+GROUP BY
+    current_month_end,
+    customer_id,
+    user_status
+
+
+
+
+
+
